@@ -1,0 +1,8 @@
+# Example proxy configuration to invert polarity of registers 40206-40209
+devices:
+  - modbus:
+      url: 192.168.178.199:502
+    listen:
+      bind: 0.0.0.0:1502
+    register_transformations:
+      "40206-40209": "* -1"
