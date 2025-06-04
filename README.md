@@ -101,6 +101,28 @@ actual modbus server.
 
 Note that **the reverse also applies**: if you forward unit ID 1 to unit ID 0, **all** responses coming from unit 0 will look as if they are coming from 1, so this may pose problems if you want to use unit ID 0 for some clients and unit ID 1 for others (use unit ID 1 for all in that case).
 
+### Transforming Register Values
+
+If some holding registers require custom scaling or polarity correction, you can specify value transformations per register using the `register_transformations` key in your device configuration. Each entry maps a register address or a range (`"start-end"`) to a simple formula string (for example, `"* -1"` to invert polarity or `"+ 5"` to add an offset).
+
+Supported operations:
+  * Multiplication (`*`)
+  * Division (`/`)
+  * Addition (`+`)
+  * Subtraction (`-`)
+
+Example:
+```yaml
+devices:
+- modbus:
+    url: plc1.acme.org:502
+  listen:
+    bind: 0:9000
+  register_transformations:
+    "40206-40209": "* -1"   # invert sign for registers 40206 to 40209
+    "40010": "+ 100"       # add 100 to register 40010
+```
+
 ## Running the examples
 
 To run the examples you will need to have
@@ -135,6 +157,29 @@ Finally run a the example client but now address the proxy instead of the server
 $ python examples/simple_tcp_client.py -a 0:9000
 holding registers: [1, 2, 3, 4]
 ```
+
+### Register Transformation Example
+
+To apply register value transformations (e.g. polarity inversion or fixing other wrong values),
+start the proxy with the example config:
+
+```bash
+$ modbus-proxy -c examples/reg_transform_proxy.yml
+```
+
+Then run the inspection script:
+
+```bash
+$ python examples/check.py --host 127.0.0.1 --port 1502 --reg 40206 --count 4
+addr    offset    value
+40206   5         -23120
+40207   6         23151
+40208   7         -23151
+40209   8         23120
+```
+
+(Adjust host, port, reg, and count as needed.)
+
 ## Running as a Service
 1. move the config file to a location you can remember, for example: to `/usr/lib/mproxy-conf.yaml`
 2. go to `/etc/systemd/system/`

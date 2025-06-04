@@ -13,6 +13,8 @@ import warnings
 import contextlib
 import logging.config
 from urllib.parse import urlparse
+import re
+import ast
 
 __version__ = "0.8.0"
 
@@ -133,6 +135,12 @@ class ModBus(Connection):
         self.timeout = modbus.get("timeout", None)
         self.connection_time = modbus.get("connection_time", 0)
         self.unit_id_remapping = config.get("unit_id_remapping") or {}
+        # prepare register value transformations (holding registers)
+        # config key 'register_transformations' maps register addresses or ranges to simple formulas
+        transforms_cfg = config.get("register_transformations") or {}
+        self._register_transforms = self._init_register_transforms(transforms_cfg)
+        # track expanded read requests for cross-register transforms
+        self._pending_reqs = {}
         self.server = None
         self.lock = asyncio.Lock()
 
@@ -173,23 +181,200 @@ class ModBus(Connection):
         return await self._read()
 
     def _transform_request(self, request):
-        uid = request[6]
+        """
+        Transform outgoing request PDU: apply unit ID remapping,
+        and expand read requests to fetch any registers needed by transformations.
+        """
+        # make mutable copy
+        req = bytearray(request)
+        # remap unit ID if configured
+        uid = req[6]
         new_uid = self.unit_id_remapping.setdefault(uid, uid)
         if uid != new_uid:
-            request = bytearray(request)
-            request[6] = new_uid
+            req[6] = new_uid
             self.log.debug("remapping unit ID %s to %s in request", uid, new_uid)
-        return request
+        # expand read holding/input registers to cover transform dependencies
+        if self._register_transforms:
+            try:
+                func = req[7]
+                # only for function codes 3 (holding) and 4 (input)
+                if func in (3, 4) and len(req) >= 12:
+                    orig_start = int.from_bytes(req[8:10], 'big')
+                    orig_count = int.from_bytes(req[10:12], 'big')
+                    exp_start = orig_start
+                    exp_count = orig_count
+                    needed = []
+                    # find any transforms targeting this block and collect deps
+                    for dest_start, dest_end, fn, deps in self._register_transforms:
+                        if dest_end < orig_start or dest_start > orig_start + orig_count - 1:
+                            continue
+                        for human in deps:
+                            # convert human reg number to PDU address
+                            needed.append(human - 40001)
+                    if needed:
+                        # combine original and needed addresses
+                        all_addrs = list(range(orig_start, orig_start + orig_count)) + needed
+                        new_start = min(all_addrs)
+                        new_end = max(all_addrs)
+                        exp_start = new_start
+                        exp_count = new_end - new_start + 1
+                        # modify PDU starting address and count
+                        req[8:10] = exp_start.to_bytes(2, 'big')
+                        req[10:12] = exp_count.to_bytes(2, 'big')
+                        self.log.debug(
+                            "expanded read from %d..%d (%d) to %d..%d (%d) for transforms",
+                            orig_start, orig_start + orig_count - 1, orig_count,
+                            exp_start, exp_start + exp_count - 1, exp_count,
+                        )
+                        # track original and expanded parameters by transaction ID
+                        tid = bytes(req[0:2])
+                        self._pending_reqs[tid] = (orig_start, orig_count, exp_start, exp_count)
+            except Exception:
+                pass
+        return bytes(req)
 
-    def _transform_reply(self, reply):
-        uid = reply[6]
-        inverse_unit_id_map = {v: k for k, v in self.unit_id_remapping.items()}
-        new_uid = inverse_unit_id_map.setdefault(uid, uid)
+    def _init_register_transforms(self, transforms_cfg):
+        """
+        Build transformation functions for specified registers.
+        transforms_cfg maps destination register (or range) to a formula string.
+        Formulas can reference other registers as $<regnum> (e.g. '$40210 * 0.5'),
+        or be unary operations '* -1', '+ 5', etc., implying current register.
+        Returns a list of (dest_start, dest_end, transform_fn).
+        """
+        transforms = []
+        var_re = re.compile(r"\$(\d+)")
+        unary_re = re.compile(r"^\s*(?P<op>[+\-*/])\s*(?P<val>-?\d+(?:\.\d*)?)\s*$")
+        for key, formula in transforms_cfg.items():
+            if isinstance(key, str) and '-' in key:
+                dstart, dend = key.split('-', 1)
+                dest_start = int(dstart)
+                dest_end = int(dend)
+            else:
+                dest_start = dest_end = int(key)
+            if dest_start >= 40000:
+                dest_start -= 40001
+            if dest_end >= 40000:
+                dest_end -= 40001
+            m_un = unary_re.match(formula)
+            if m_un:
+                op = m_un.group('op')
+                val_str = m_un.group('val')
+                try:
+                    operand = int(val_str)
+                except ValueError:
+                    operand = float(val_str)
+                def make_unary(op, operand):
+                    def fn(raw, human, ctx):
+                        v = raw - 0x10000 if (raw & 0x8000) else raw
+                        if op == '*':
+                            r = v * operand
+                        elif op == '/':
+                            r = int(v / operand)
+                        elif op == '+':
+                            r = v + operand
+                        else:
+                            r = v - operand
+                        return max(min(int(r), 0x7FFF), -0x8000)
+                    return fn
+                fn = make_unary(op, operand)
+                # no external dependencies for unary ops
+                deps = []
+                # register unary transform
+                transforms.append((dest_start, dest_end, fn, deps))
+            else:
+                expr = var_re.sub(lambda m: f"r{m.group(1)}", formula)
+                # capture referenced registers (human numbers)
+                deps = [int(n) for n in var_re.findall(formula)]
+                try:
+                    tree = ast.parse(expr, mode='eval')
+                except Exception as e:
+                    raise ValueError(f"Invalid formula '{formula}' for register {key}: {e}")
+                for node in ast.walk(tree):
+                    if not isinstance(node, (
+                        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+                        ast.Name, ast.Load, ast.Add, ast.Sub, ast.Mult, ast.Div,
+                        ast.UAdd, ast.USub, ast.Call
+                    )):
+                        raise ValueError(f"Unsupported AST node {node} in formula '{formula}'")
+                    if isinstance(node, ast.Call):
+                        if not (isinstance(node.func, ast.Name) and node.func.id in ('int', 'float')):
+                            raise ValueError(f"Unsupported function {node.func.id} in formula '{formula}'")
+                code = compile(tree, '<formula>', 'eval')
+                def make_expr(code):
+                    def fn(raw, human, ctx):
+                        try:
+                            v = raw - 0x10000 if (raw & 0x8000) else raw
+                            ctx[f"r{human}"] = v
+                            new_val = eval(code, {'__builtins__': {}}, ctx)
+                        except Exception:
+                            return v
+                        try:
+                            r = int(new_val)
+                        except Exception:
+                            r = 0
+                        return max(min(r, 0x7FFF), -0x8000)
+                    return fn
+                fn = make_expr(code)
+                transforms.append((dest_start, dest_end, fn, deps))
+        return transforms
+
+    def _transform_reply(self, reply, request):
+        """
+        Transform incoming reply PDU: apply unit ID inverse remapping,
+        apply register value transformations, and trim any expanded data back
+        to the original request size.
+        """
+        data = bytearray(reply)
+        # inverse unit ID remapping
+        uid = data[6]
+        inverse_map = {v: k for k, v in self.unit_id_remapping.items()}
+        new_uid = inverse_map.setdefault(uid, uid)
         if uid != new_uid:
-            reply = bytearray(reply)
-            reply[6] = new_uid
+            data[6] = new_uid
             self.log.debug("remapping unit ID %s to %s in reply", uid, new_uid)
-        return reply
+        # apply register transformations for holding/input registers (function codes 3 and 4)
+        if self._register_transforms and len(data) >= 9:
+            func = data[7]
+            if func in (3, 4):
+                # determine original and expanded ranges
+                tid = bytes(data[0:2])
+                mapping = self._pending_reqs.pop(tid, None)
+                if mapping:
+                    orig_start, orig_count, exp_start, exp_count = mapping
+                else:
+                    orig_start = int.from_bytes(request[8:10], 'big')
+                    orig_count = int.from_bytes(request[10:12], 'big')
+                    exp_start, exp_count = orig_start, orig_count
+                # build context for expression evaluation over expanded block
+                ctx = {'int': int, 'float': float}
+                for j in range(exp_count):
+                    off = 9 + j * 2
+                    raw = int.from_bytes(data[off:off+2], 'big')
+                    val = raw - 0x10000 if (raw & 0x8000) else raw
+                    human = exp_start + j + 40001
+                    ctx[f'r{human}'] = val
+                # apply each transformation function to the expanded block
+                for dest_start, dest_end, fn, deps in self._register_transforms:
+                    for i in range(exp_count):
+                        reg_addr = exp_start + i
+                        if dest_start <= reg_addr <= dest_end:
+                            off = 9 + i * 2
+                            raw = int.from_bytes(data[off:off+2], 'big')
+                            human = reg_addr + 40001
+                            new_val = fn(raw, human, ctx)
+                            raw2 = new_val & 0xFFFF
+                            data[off] = (raw2 >> 8) & 0xFF
+                            data[off + 1] = raw2 & 0xFF
+                # if we expanded beyond the original request, trim back
+                if exp_count != orig_count:
+                    # update MBAP length (bytes[4:6]) = unit(1)+func(1)+bytecount(1)+data(2*orig_count)
+                    new_len = 3 + 2 * orig_count
+                    data[4:6] = new_len.to_bytes(2, 'big')
+                    # update byte count at data[8]
+                    data[8] = (2 * orig_count) & 0xFF
+                    # trim extra register data
+                    data = data[:9 + 2 * orig_count]
+        return data
 
     async def handle_client(self, reader, writer):
         async with Client(reader, writer) as client:
@@ -197,10 +382,14 @@ class ModBus(Connection):
                 request = await client.read()
                 if not request:
                     break
-                reply = await self.write_read(self._transform_request(request))
+                # send request to actual device (with unit ID remapping)
+                transformed_req = self._transform_request(request)
+                reply = await self.write_read(transformed_req)
                 if not reply:
                     break
-                result = await client.write(self._transform_reply(reply))
+                # transform reply (unit ID and register values)
+                reply = self._transform_reply(reply, request)
+                result = await client.write(reply)
                 if not result:
                     break
 
