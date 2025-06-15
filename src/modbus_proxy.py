@@ -149,6 +149,8 @@ class ModBus(Connection):
         self.cache_ttl = config.get("cache_ttl", 0)
         # simple cache for small reads: map (func, start, count) -> (timestamp, reply_bytes)
         self._cache = {}
+        # per-register cache: map (func, register_address) -> (timestamp, 2-byte raw value)
+        self._reg_cache = {}
         loop = asyncio.get_event_loop()
         if self.rate_limit:
             self._rate_limit_interval = 1.0 / self.rate_limit
@@ -184,28 +186,131 @@ class ModBus(Connection):
         Send a Modbus request and read the reply, splitting large reads
         (function codes 3 & 4) into <= MAX_READ_REGISTERS chunks.
         """
-        # initial cache check for small read-holding/input requests (avoid locking)
+        # detect small read-holding/input requests
         is_read = len(data) >= 12 and data[7] in (3, 4)
         if self.cache_ttl and is_read:
             start = int.from_bytes(data[8:10], 'big')
             count = int.from_bytes(data[10:12], 'big')
             if count <= self.MAX_READ_REGISTERS:
-                key = (data[7], start, count)
+                func = data[7]
+                # block-level cache check
+                key = (func, start, count)
                 ts, reply = self._cache.get(key, (0, None))
                 if reply is not None and (time.time() - ts) < self.cache_ttl:
                     self.log.debug("cache hit for %s", key)
                     return reply
+                # per-register cache check: return immediately if all regs are fresh
+                now = time.time()
+                fresh = {}
+                missing = []
+                for i in range(count):
+                    reg = start + i
+                    entry = self._reg_cache.get((func, reg))
+                    if entry and (now - entry[0]) < self.cache_ttl:
+                        fresh[i] = entry[1]
+                    else:
+                        missing.append(i)
+                if not missing:
+                    # assemble full reply from per-register cache
+                    data_bytes = b''.join(fresh[i] for i in range(count))
+                    tid = data[0:2]
+                    proto = data[2:4]
+                    unit = data[6]
+                    bytecount = 2 * count
+                    length = 3 + bytecount
+                    reply = (
+                        tid + proto + length.to_bytes(2, 'big')
+                        + bytes([unit, func, bytecount])
+                        + data_bytes
+                    )
+                    return reply
         async with self.lock:
-            # double-check cache after acquiring lock
+            # double-check block-level cache after acquiring lock
             if self.cache_ttl and len(data) >= 12 and data[7] in (3, 4):
                 start = int.from_bytes(data[8:10], 'big')
                 count = int.from_bytes(data[10:12], 'big')
+                func = data[7]
                 if count <= self.MAX_READ_REGISTERS:
-                    key = (data[7], start, count)
+                    key = (func, start, count)
                     ts, reply = self._cache.get(key, (0, None))
                     if reply is not None and (time.time() - ts) < self.cache_ttl:
                         self.log.debug("cache hit for %s", key)
                         return reply
+                    # per-register cache double-check
+                    now = time.time()
+                    fresh = {}
+                    missing = []
+                    for i in range(count):
+                        reg = start + i
+                        entry = self._reg_cache.get((func, reg))
+                        if entry and (now - entry[0]) < self.cache_ttl:
+                            fresh[i] = entry[1]
+                        else:
+                            missing.append(i)
+                    if not missing:
+                        # assemble full reply from per-register cache
+                        data_bytes = b''.join(fresh[i] for i in range(count))
+                        tid = data[0:2]
+                        proto = data[2:4]
+                        unit = data[6]
+                        bytecount = 2 * count
+                        length = 3 + bytecount
+                        reply = (
+                            tid + proto + length.to_bytes(2, 'big')
+                            + bytes([unit, func, bytecount])
+                            + data_bytes
+                        )
+                        # update block-level cache
+                        self._cache[key] = (time.time(), reply)
+                        return reply
+                    # fetch only missing register segments
+                    segments = []
+                    prev = None
+                    for idx in missing:
+                        if prev is None or idx != prev + 1:
+                            segments.append([idx])
+                        else:
+                            segments[-1].append(idx)
+                        prev = idx
+                    # fetch each missing contiguous segment
+                    for seg in segments:
+                        seg_start = seg[0]
+                        seg_count = len(seg)
+                        # build chunk request for this sub-range
+                        chunk = bytearray(data)
+                        chunk[8:10] = (start + seg_start).to_bytes(2, 'big')
+                        chunk[10:12] = seg_count.to_bytes(2, 'big')
+                        # perform backend fetch
+                        await self.connect()
+                        await self._apply_rate_limit()
+                        reply_seg = await asyncio.wait_for(
+                            self._write_read(chunk), self.timeout
+                        )
+                        if not reply_seg:
+                            return None
+                        bytecount = reply_seg[8]
+                        seg_bytes = reply_seg[9:9 + bytecount]
+                        # update per-register cache and collect data
+                        for j in range(seg_count):
+                            val_bytes = seg_bytes[2 * j:2 * j + 2]
+                            regno = start + seg_start + j
+                            self._reg_cache[(func, regno)] = (time.time(), val_bytes)
+                            fresh[seg_start + j] = val_bytes
+                    # assemble full data bytes
+                    data_bytes = b''.join(fresh[i] for i in range(count))
+                    tid = data[0:2]
+                    proto = data[2:4]
+                    unit = data[6]
+                    bytecount = 2 * count
+                    length = 3 + bytecount
+                    reply = (
+                        tid + proto + length.to_bytes(2, 'big')
+                        + bytes([unit, func, bytecount])
+                        + data_bytes
+                    )
+                    # update block-level cache
+                    self._cache[key] = (time.time(), reply)
+                    return reply
             for i in range(attempts):
                 try:
                     await self.connect()
