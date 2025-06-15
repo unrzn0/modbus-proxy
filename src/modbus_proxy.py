@@ -618,6 +618,22 @@ class ModBus(Connection):
                 request = await client.read()
                 if not request:
                     break
+                # reject client read requests > MAX_READ_REGISTERS per Modbus spec
+                if len(request) >= 12 and request[7] in (3, 4):
+                    start = int.from_bytes(request[8:10], 'big')
+                    count = int.from_bytes(request[10:12], 'big')
+                    if count > self.MAX_READ_REGISTERS:
+                        # build Modbus exception: ILLEGAL_DATA_VALUE (code 3)
+                        tid = request[0:2]
+                        proto = request[2:4]
+                        # PDU: unit(1) + func_error(1) + exception_code(1) = 3 bytes
+                        length = (3).to_bytes(2, 'big')
+                        unit = request[6]
+                        func_err = request[7] | 0x80
+                        ex_code = 3
+                        reply = tid + proto + length + bytes([unit, func_err, ex_code])
+                        await client.write(reply)
+                        continue
                 # send request to actual device (with unit ID remapping)
                 transformed_req = self._transform_request(request)
                 reply = await self.write_read(transformed_req)
