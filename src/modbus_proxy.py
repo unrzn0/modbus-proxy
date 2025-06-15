@@ -184,8 +184,19 @@ class ModBus(Connection):
         Send a Modbus request and read the reply, splitting large reads
         (function codes 3 & 4) into <= MAX_READ_REGISTERS chunks.
         """
+        # initial cache check for small read-holding/input requests (avoid locking)
+        is_read = len(data) >= 12 and data[7] in (3, 4)
+        if self.cache_ttl and is_read:
+            start = int.from_bytes(data[8:10], 'big')
+            count = int.from_bytes(data[10:12], 'big')
+            if count <= self.MAX_READ_REGISTERS:
+                key = (data[7], start, count)
+                ts, reply = self._cache.get(key, (0, None))
+                if reply is not None and (time.time() - ts) < self.cache_ttl:
+                    self.log.debug("cache hit for %s", key)
+                    return reply
         async with self.lock:
-            # caching for small read-holding/input requests
+            # double-check cache after acquiring lock
             if self.cache_ttl and len(data) >= 12 and data[7] in (3, 4):
                 start = int.from_bytes(data[8:10], 'big')
                 count = int.from_bytes(data[10:12], 'big')
