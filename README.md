@@ -164,13 +164,13 @@ To apply register value transformations (e.g. polarity inversion or fixing other
 start the proxy with the example config:
 
 ```bash
-$ modbus-proxy -c examples/reg_transform_proxy.yml
+$ modbus-proxy -c examples/polarity_proxy.yml
 ```
 
-Then run the inspection script:
+Then run the inspection script (`examples/check_polarity.py`):
 
 ```bash
-$ python examples/check.py --host 127.0.0.1 --port 1502 --reg 40206 --count 4
+$ python examples/check_polarity.py --host 127.0.0.1 --port 1502 --reg 40206 --count 4
 addr    offset    value
 40206   5         -23120
 40207   6         23151
@@ -179,6 +179,18 @@ addr    offset    value
 ```
 
 (Adjust host, port, reg, and count as needed.)
+
+### Rate Limiting & Caching
+
+You can configure the proxy to throttle requests and cache repeated reads:
+
+```bash
+$ modbus-proxy -c examples/rate_cache_proxy.yml
+```
+
+The example file sets:
+  * `rate_limit`: maximum backend requests per second
+  * `cache_ttl`: seconds to cache small read (≤125 regs) replies
 
 ## Running as a Service
 1. move the config file to a location you can remember, for example: to `/usr/lib/mproxy-conf.yaml`
