@@ -7,6 +7,7 @@
 
 
 import asyncio
+import time
 import pathlib
 import argparse
 import warnings
@@ -143,6 +144,21 @@ class ModBus(Connection):
         self._pending_reqs = {}
         self.server = None
         self.lock = asyncio.Lock()
+        # optional rate-limit (requests per second) and cache TTL (seconds)
+        self.rate_limit = config.get("rate_limit", 0)
+        self.cache_ttl = config.get("cache_ttl", 0)
+        # simple cache for small reads: map (func, start, count) -> (timestamp, reply_bytes)
+        self._cache = {}
+        loop = asyncio.get_event_loop()
+        if self.rate_limit:
+            self._rate_limit_interval = 1.0 / self.rate_limit
+            # allow immediate first request
+            self._last_rate_time = loop.time() - self._rate_limit_interval
+        else:
+            self._rate_limit_interval = 0
+            self._last_rate_time = 0
+    # maximum registers per read-holding or read-input request
+    MAX_READ_REGISTERS = 125
 
     @property
     def address(self):
@@ -164,12 +180,46 @@ class ModBus(Connection):
                 await asyncio.sleep(self.connection_time)
 
     async def write_read(self, data, attempts=2):
+        """
+        Send a Modbus request and read the reply, splitting large reads
+        (function codes 3 & 4) into <= MAX_READ_REGISTERS chunks.
+        """
         async with self.lock:
+            # caching for small read-holding/input requests
+            if self.cache_ttl and len(data) >= 12 and data[7] in (3, 4):
+                start = int.from_bytes(data[8:10], 'big')
+                count = int.from_bytes(data[10:12], 'big')
+                if count <= self.MAX_READ_REGISTERS:
+                    key = (data[7], start, count)
+                    ts, reply = self._cache.get(key, (0, None))
+                    if reply is not None and (time.time() - ts) < self.cache_ttl:
+                        self.log.debug("cache hit for %s", key)
+                        return reply
             for i in range(attempts):
                 try:
                     await self.connect()
+                    # rate limiting
+                    await self._apply_rate_limit()
+                    # detect oversized read-holding (3) or read-input (4)
+                    if len(data) >= 12 and data[7] in (3, 4):
+                        start = int.from_bytes(data[8:10], 'big')
+                        count = int.from_bytes(data[10:12], 'big')
+                        if count > self.MAX_READ_REGISTERS:
+                            return await asyncio.wait_for(
+                                self._batch_read(data),
+                                self.timeout,
+                            )
+                    # normal request
                     coro = self._write_read(data)
-                    return await asyncio.wait_for(coro, self.timeout)
+                    reply = await asyncio.wait_for(coro, self.timeout)
+                    # store in cache if applicable
+                    if self.cache_ttl and len(data) >= 12 and data[7] in (3, 4):
+                        start = int.from_bytes(data[8:10], 'big')
+                        count = int.from_bytes(data[10:12], 'big')
+                        if count <= self.MAX_READ_REGISTERS:
+                            key = (data[7], start, count)
+                            self._cache[key] = (time.time(), reply)
+                    return reply
                 except Exception as error:
                     self.log.error(
                         "write_read error [%s/%s]: %r", i + 1, attempts, error
@@ -179,6 +229,71 @@ class ModBus(Connection):
     async def _write_read(self, data):
         await self._write(data)
         return await self._read()
+    
+    async def _batch_read(self, request):
+        """
+        Split a large Read (FC3/4) into chunks of <= MAX_READ_REGISTERS,
+        request each chunk, and stitch together a single combined reply.
+        """
+        # Parse MBAP header and PDU fields
+        tid = request[0:2]
+        proto = request[2:4]
+        unit = request[6]
+        func = request[7]
+        start = int.from_bytes(request[8:10], 'big')
+        count = int.from_bytes(request[10:12], 'big')
+        blocks = []
+        idx = 0
+        # Issue chunked reads
+        while idx < count:
+            chunk_count = min(self.MAX_READ_REGISTERS, count - idx)
+            chunk_start = start + idx
+            # Build chunk request frame
+            chunk = bytearray(12)
+            chunk[0:2] = tid
+            chunk[2:4] = proto
+            # PDU length (unit+func+addr+count) = 6
+            chunk[4:6] = (6).to_bytes(2, 'big')
+            chunk[6] = unit
+            chunk[7] = func
+            chunk[8:10] = chunk_start.to_bytes(2, 'big')
+            chunk[10:12] = chunk_count.to_bytes(2, 'big')
+            # Send and await reply
+            reply = await self._write_read(chunk)
+            if not reply:
+                return None
+            # Extract bytecount and data
+            bytecount = reply[8]
+            data_bytes = reply[9:9 + bytecount]
+            blocks.append(data_bytes)
+            idx += chunk_count
+        # Concatenate all data blocks
+        full_data = b''.join(blocks)
+        total_bytecount = len(full_data)
+        # Build combined MBAP header
+        length = 3 + total_bytecount  # unit + func + bytecount + data
+        header = bytearray(6)
+        header[0:2] = tid
+        header[2:4] = proto
+        header[4:6] = length.to_bytes(2, 'big')
+        # Build payload
+        payload = bytearray([unit, func, total_bytecount])
+        # Return the assembled reply
+        return bytes(header) + bytes(payload) + full_data
+    
+    async def _apply_rate_limit(self):
+        """
+        Enforce a simple fixed-interval rate limit between backend requests.
+        """
+        if self._rate_limit_interval <= 0:
+            return
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+        elapsed = now - self._last_rate_time
+        if elapsed < self._rate_limit_interval:
+            await asyncio.sleep(self._rate_limit_interval - elapsed)
+            now = loop.time()
+        self._last_rate_time = now
 
     def _transform_request(self, request):
         """

@@ -1,0 +1,16 @@
+"""
+Example ModBus Proxy configuration enabling rate limiting and response caching
+
+Adjust the host, ports, rate_limit (requests/sec) and cache_ttl (seconds) as needed.
+"""
+devices:
+  - modbus:
+      url: 192.168.178.199:502    # Inverter / device address
+      timeout: 10                  # request timeout (s)
+      connection_time: 0.1         # delay after connect (s)
+    listen:
+      bind: 0.0.0.0:1502           # proxy listen address
+    rate_limit: 5                  # max 5 requests per second to the device
+    cache_ttl: 1.0                 # cache small reads for 1 second
+    register_transformations:
+      "40199": "int($40195 * 1.72)"  # cross-register formula example
