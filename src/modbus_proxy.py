@@ -337,9 +337,17 @@ class ModBus(Connection):
                             self._cache[key] = (time.time(), reply)
                     return reply
                 except Exception as error:
+                    # log the backend I/O error
                     self.log.error(
                         "write_read error [%s/%s]: %r", i + 1, attempts, error
                     )
+                    # clear any cached data to avoid serving stale replies
+                    if self.cache_ttl:
+                        self._cache.clear()
+                        self._reg_cache.clear()
+                    # clear pending transform mappings to reset state
+                    self._pending_reqs.clear()
+                    # close the backend connection so next attempt reconnects
                     await self.close()
 
     async def _write_read(self, data):
