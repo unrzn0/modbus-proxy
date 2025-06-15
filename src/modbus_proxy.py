@@ -491,15 +491,20 @@ class ModBus(Connection):
                             raw2 = new_val & 0xFFFF
                             data[off] = (raw2 >> 8) & 0xFF
                             data[off + 1] = raw2 & 0xFF
-                # if we expanded beyond the original request, trim back
+                # if we expanded beyond the original request, trim and re-align
                 if exp_count != orig_count:
-                    # update MBAP length (bytes[4:6]) = unit(1)+func(1)+bytecount(1)+data(2*orig_count)
+                    # calculate how many registers were prepended
+                    skip = orig_start - exp_start
+                    # update MBAP length: unit(1) + func(1) + bytecount(1) + 2*orig_count
                     new_len = 3 + 2 * orig_count
                     data[4:6] = new_len.to_bytes(2, 'big')
                     # update byte count at data[8]
-                    data[8] = (2 * orig_count) & 0xFF
-                    # trim extra register data
-                    data = data[:9 + 2 * orig_count]
+                    bytecount = 2 * orig_count
+                    data[8] = bytecount & 0xFF
+                    # slice only the original requested registers
+                    start = 9 + skip * 2
+                    end = start + bytecount
+                    data = data[:9] + data[start:end]
         return data
 
     async def handle_client(self, reader, writer):
