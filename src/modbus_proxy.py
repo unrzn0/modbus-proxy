@@ -432,11 +432,14 @@ class ModBus(Connection):
         if uid != new_uid:
             req[6] = new_uid
             self.log.debug("remapping unit ID %s to %s in request", uid, new_uid)
-        # detect human-style addressing (absolute >=40001) and normalize to 0-based offset
+        # detect human-style addressing (absolute >=40000) and normalize to 0-based offset
         if len(req) >= 12 and req[7] in (3, 4):
             raw_start = int.from_bytes(req[8:10], 'big')
-            if raw_start >= 40001:
+            if raw_start >= 40000:
+                # support both 40000-based and 40001-based human numbering
                 new_start = raw_start - 40001
+                if new_start < 0:
+                    new_start = 0
                 self.log.warning(
                     "human-style register request detected: remapping start %d to offset %d",
                     raw_start, new_start
