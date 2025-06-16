@@ -599,8 +599,15 @@ class ModBus(Connection):
                         if dest_start <= reg_addr <= dest_end:
                             off = 9 + i * 2
                             raw = int.from_bytes(data[off:off+2], 'big')
+                            # signed 16-bit value
+                            signed = raw - 0x10000 if (raw & 0x8000) else raw
                             human = reg_addr + 40001
                             new_val = fn(raw, human, ctx)
+                            # log transformation details
+                            self.log.debug(
+                                "transform register %d (human %d): %d -> %d",
+                                reg_addr, human, signed, new_val
+                            )
                             raw2 = new_val & 0xFFFF
                             data[off] = (raw2 >> 8) & 0xFF
                             data[off + 1] = raw2 & 0xFF
