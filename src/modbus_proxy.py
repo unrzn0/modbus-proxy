@@ -731,8 +731,20 @@ def parse_args(args=None):
         default=10,
         help="modbus connection and request timeout in seconds",
     )
+    parser.add_argument(
+        "--export-log-config",
+        action="store_true",
+        help="Export default logging configuration as YAML and exit",
+    )
+    parser.add_argument(
+        "--export-full-config",
+        action="store_true",
+        help="Export full configuration template with defaults as YAML and exit",
+    )
     options = parser.parse_args(args=args)
-
+    # If exporting logging or full config, skip further argument validation
+    if getattr(options, "export_log_config", False) or getattr(options, "export_full_config", False):
+        return options
     if not options.config_file and not options.modbus:
         parser.exit(1, "must give a config-file or/and a --modbus")
     return options
@@ -782,6 +794,69 @@ async def run_bridges(bridges, ready=None):
 
 async def run(args=None, ready=None):
     args = parse_args(args)
+    # export full configuration template if requested
+    if getattr(args, "export_full_config", False):
+        # load any existing config file or start from empty
+        config = load_config(args.config_file) if args.config_file else {}
+        # merge CLI-specified device into devices list
+        devices = config.get("devices", [])
+        if getattr(args, "modbus", None):
+            listen_bind = args.bind if args.bind is not None else ":502"
+            devices.append({
+                "modbus": {
+                    "url": args.modbus,
+                    "timeout": args.timeout,
+                    "connection_time": args.modbus_connection_time,
+                },
+                "listen": {"bind": listen_bind},
+            })
+        config["devices"] = devices
+        # fill defaults for each device entry
+        for d in config.get("devices", []):
+            mb = d.get("modbus", {})
+            mb.setdefault("timeout", args.timeout)
+            mb.setdefault("connection_time", args.modbus_connection_time)
+            d["modbus"] = mb
+            ln = d.get("listen", {})
+            if "bind" not in ln:
+                ln["bind"] = args.bind if args.bind is not None else ":502"
+            d["listen"] = ln
+            d.setdefault("unit_id_remapping", {})
+            d.setdefault("register_transformations", {})
+            d.setdefault("rate_limit", 0)
+            d.setdefault("cache_ttl", 0)
+        # prepare default logging block
+        log_cfg = DEFAULT_LOG_CONFIG.copy()
+        log_cfg.setdefault("disable_existing_loggers", False)
+        # assemble export dict with ordered sections
+        export = {
+            "logging": log_cfg,
+            "devices": config.get("devices", []),
+        }
+        # output as YAML (or JSON fallback)
+        try:
+            import yaml
+            # preserve insertion order: sort_keys=False requires PyYAML>=5.1
+            print(yaml.dump(export, default_flow_style=False, sort_keys=False))
+        except ImportError:
+            import json
+            print(json.dumps(export, indent=2))
+        return
+    # export default logging configuration if requested
+    if getattr(args, "export_log_config", False):
+        # export default logging configuration
+        # include disable_existing_loggers default
+        cfg = DEFAULT_LOG_CONFIG.copy()
+        cfg.setdefault("disable_existing_loggers", False)
+        try:
+            import yaml
+
+            print(yaml.dump(cfg, default_flow_style=False))
+        except ImportError:
+            import json
+
+            print(json.dumps(cfg, indent=2))
+        return
     config = create_config(args)
     bridges = create_bridges(config)
     await run_bridges(bridges, ready=ready)
