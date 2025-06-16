@@ -432,26 +432,14 @@ class ModBus(Connection):
         if uid != new_uid:
             req[6] = new_uid
             self.log.debug("remapping unit ID %s to %s in request", uid, new_uid)
-        # expand read holding/input registers to cover transform dependencies,
-        # also detect human-style addressing (absolute >=40001)
+        # expand read holding/input registers to cover transform dependencies
         if self._register_transforms:
             try:
                 func = req[7]
                 # only for function codes 3 (holding) and 4 (input)
                 if func in (3, 4) and len(req) >= 12:
-                    # extract raw start and count
-                    raw_start = int.from_bytes(req[8:10], 'big')
+                    orig_start = int.from_bytes(req[8:10], 'big')
                     orig_count = int.from_bytes(req[10:12], 'big')
-                    # detect human-style address (40001-based) and remap
-                    if raw_start >= 40001:
-                        new_start = raw_start - 40001
-                        self.log.warning(
-                            "human-style register request detected: remapping start %d to offset %d",
-                            raw_start, new_start
-                        )
-                        req[8:10] = new_start.to_bytes(2, 'big')
-                        raw_start = new_start
-                    orig_start = raw_start
                     exp_start = orig_start
                     exp_count = orig_count
                     needed = []
@@ -667,33 +655,6 @@ class ModBus(Connection):
                 reply = await self.write_read(transformed_req)
                 if not reply:
                     break
-                # on Illegal Data Address, try fallback remapping of human-/zero-based numbering
-                if (len(reply) >= 9 and reply[7] & 0x80 and reply[8] == 2
-                        and len(request) >= 12 and request[7] in (3, 4)):
-                    # original PDU start (raw)
-                    raw_start = int.from_bytes(request[8:10], 'big')
-                    # compute fallback: swap between human- and zero-based
-                    if raw_start >= 40001:
-                        fb_start = raw_start - 40001
-                    else:
-                        fb_start = raw_start + 40001
-                    self.log.warning(
-                        "fallback register remap: start %d -> %d, retrying read",
-                        raw_start, fb_start,
-                    )
-                    # build fallback request
-                    fb_req = bytearray(request)
-                    fb_req[8:10] = fb_start.to_bytes(2, 'big')
-                    # reapply transforms/unit remap
-                    fb_transformed = self._transform_request(bytes(fb_req))
-                    fb_reply = await self.write_read(fb_transformed)
-                    # if fallback succeeds (not an exception), use it
-                    if fb_reply and not (len(fb_reply) >= 9 and fb_reply[7] & 0x80):
-                        self.log.info(
-                            "fallback read successful for start %d (client raw %d)",
-                            fb_start, raw_start,
-                        )
-                        reply = fb_reply
                 # transform reply (unit ID and register values)
                 reply = self._transform_reply(reply, request)
                 # send final reply back to client
