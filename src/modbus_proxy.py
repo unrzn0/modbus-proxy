@@ -432,14 +432,26 @@ class ModBus(Connection):
         if uid != new_uid:
             req[6] = new_uid
             self.log.debug("remapping unit ID %s to %s in request", uid, new_uid)
-        # expand read holding/input registers to cover transform dependencies
+        # expand read holding/input registers to cover transform dependencies,
+        # also detect human-style addressing (absolute >=40001)
         if self._register_transforms:
             try:
                 func = req[7]
                 # only for function codes 3 (holding) and 4 (input)
                 if func in (3, 4) and len(req) >= 12:
-                    orig_start = int.from_bytes(req[8:10], 'big')
+                    # extract raw start and count
+                    raw_start = int.from_bytes(req[8:10], 'big')
                     orig_count = int.from_bytes(req[10:12], 'big')
+                    # detect human-style address (40001-based) and remap
+                    if raw_start >= 40001:
+                        new_start = raw_start - 40001
+                        self.log.warning(
+                            "human-style register request detected: remapping start %d to offset %d",
+                            raw_start, new_start
+                        )
+                        req[8:10] = new_start.to_bytes(2, 'big')
+                        raw_start = new_start
+                    orig_start = raw_start
                     exp_start = orig_start
                     exp_count = orig_count
                     needed = []
