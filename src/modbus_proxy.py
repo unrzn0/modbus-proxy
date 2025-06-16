@@ -424,7 +424,7 @@ class ModBus(Connection):
         Transform outgoing request PDU: apply unit ID remapping,
         and expand read requests to fetch any registers needed by transformations.
         """
-        # make mutable copy
+        # build mutable copy for backend request
         req = bytearray(request)
         # remap unit ID if configured
         uid = req[6]
@@ -432,57 +432,44 @@ class ModBus(Connection):
         if uid != new_uid:
             req[6] = new_uid
             self.log.debug("remapping unit ID %s to %s in request", uid, new_uid)
-        # detect human-style addressing (absolute >=40000) and normalize to 0-based offset
-        if len(req) >= 12 and req[7] in (3, 4):
-            raw_start = int.from_bytes(req[8:10], 'big')
-            if raw_start >= 40000:
-                # support both 40000-based and 40001-based human numbering
-                new_start = raw_start - 40001
-                if new_start < 0:
-                    new_start = 0
-                self.log.warning(
-                    "human-style register request detected: remapping start %d to offset %d",
-                    raw_start, new_start
+        # attempt transform-driven expansion for holding/input reads
+        if self._register_transforms and len(req) >= 12 and req[7] in (3, 4):
+            # parse client start/count
+            raw_start = int.from_bytes(request[8:10], 'big')
+            orig_count = int.from_bytes(request[10:12], 'big')
+            # normalize human-style (>=40001) to 0-based
+            base = 40001 if raw_start >= 40001 else 0
+            norm_start = raw_start - base
+            exp_start = norm_start
+            exp_count = orig_count
+            # gather dependencies for transforms
+            needed = []
+            for dest_start, dest_end, fn, deps in self._register_transforms:
+                if dest_end < norm_start or dest_start > norm_start + orig_count - 1:
+                    continue
+                for human in deps:
+                    needed.append(human - 40001)
+            if needed:
+                # determine expanded normalized range
+                addrs = list(range(norm_start, norm_start + orig_count)) + needed
+                new_norm_start = min(addrs)
+                new_norm_end = max(addrs)
+                exp_start = new_norm_start
+                exp_count = new_norm_end - new_norm_start + 1
+                # compute backend PDU offsets
+                dev_start = exp_start + base
+                dev_count = exp_count
+                req[8:10] = dev_start.to_bytes(2, 'big')
+                req[10:12] = dev_count.to_bytes(2, 'big')
+                self.log.debug(
+                    "expanded read for transforms: norm %d..%d(%d) → %d..%d(%d) (base %d)",
+                    norm_start, norm_start + orig_count - 1, orig_count,
+                    exp_start, exp_start + exp_count - 1, exp_count,
+                    base,
                 )
-                req[8:10] = new_start.to_bytes(2, 'big')
-        # expand read holding/input registers to cover transform dependencies
-        if self._register_transforms:
-            try:
-                func = req[7]
-                # only for function codes 3 (holding) and 4 (input)
-                if func in (3, 4) and len(req) >= 12:
-                    orig_start = int.from_bytes(req[8:10], 'big')
-                    orig_count = int.from_bytes(req[10:12], 'big')
-                    exp_start = orig_start
-                    exp_count = orig_count
-                    needed = []
-                    # find any transforms targeting this block and collect deps
-                    for dest_start, dest_end, fn, deps in self._register_transforms:
-                        if dest_end < orig_start or dest_start > orig_start + orig_count - 1:
-                            continue
-                        for human in deps:
-                            # convert human reg number to PDU address
-                            needed.append(human - 40001)
-                    if needed:
-                        # combine original and needed addresses
-                        all_addrs = list(range(orig_start, orig_start + orig_count)) + needed
-                        new_start = min(all_addrs)
-                        new_end = max(all_addrs)
-                        exp_start = new_start
-                        exp_count = new_end - new_start + 1
-                        # modify PDU starting address and count
-                        req[8:10] = exp_start.to_bytes(2, 'big')
-                        req[10:12] = exp_count.to_bytes(2, 'big')
-                        self.log.debug(
-                            "expanded read from %d..%d (%d) to %d..%d (%d) for transforms",
-                            orig_start, orig_start + orig_count - 1, orig_count,
-                            exp_start, exp_start + exp_count - 1, exp_count,
-                        )
-                        # track original and expanded parameters by transaction ID
-                        tid = bytes(req[0:2])
-                        self._pending_reqs[tid] = (orig_start, orig_count, exp_start, exp_count)
-            except Exception:
-                pass
+                # track normalized mapping by transaction ID (include base)
+                tid = bytes(req[0:2])
+                self._pending_reqs[tid] = (base, norm_start, orig_count, exp_start, exp_count)
         return bytes(req)
 
     def _init_register_transforms(self, transforms_cfg):
@@ -588,13 +575,21 @@ class ModBus(Connection):
         if self._register_transforms and len(data) >= 9:
             func = data[7]
             if func in (3, 4):
-                # determine original and expanded ranges
+                # determine normalized original and expanded ranges (with optional human base)
                 tid = bytes(data[0:2])
                 mapping = self._pending_reqs.pop(tid, None)
                 if mapping:
-                    orig_start, orig_count, exp_start, exp_count = mapping
+                    # mapping may include base for human-style handling
+                    if len(mapping) == 5:
+                        base, orig_start, orig_count, exp_start, exp_count = mapping
+                    else:
+                        base = 0
+                        orig_start, orig_count, exp_start, exp_count = mapping
                 else:
-                    orig_start = int.from_bytes(request[8:10], 'big')
+                    # fallback for non-expanded requests
+                    raw_start = int.from_bytes(request[8:10], 'big')
+                    base = 40001 if raw_start >= 40001 else 0
+                    orig_start = raw_start - base
                     orig_count = int.from_bytes(request[10:12], 'big')
                     exp_start, exp_count = orig_start, orig_count
                 # build context for expression evaluation over expanded block
