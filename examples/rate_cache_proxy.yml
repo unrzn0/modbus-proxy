@@ -12,5 +12,6 @@ devices:
       bind: 0.0.0.0:1502           # proxy listen address
     rate_limit: 5                  # max 5 requests per second to the device
     cache_ttl: 1.0                 # cache small reads for 1 second
+    # register_transformations keys use human Modbus register numbers (40001-based)
     register_transformations:
       "40199": "int($40195 * 1.72)"  # cross-register formula example

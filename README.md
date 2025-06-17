@@ -25,6 +25,22 @@ Additionally, if you want logging configuration:
 * YAML: `pip install modbus-proxy[yaml]` (see below)
 * TOML: `pip install modbus-proxy[toml]` (see below)
 
+## Numbering Conventions
+
+Modbus PDU register addresses used on the wire are _zero-based_ (0..65535).  However,
+most human-facing documentation (and many vendor tools, e.g. SolarEdge) refer to
+_holding_ registers using the numbers 40001..49999, where:
+  * human register 40001 maps to PDU offset 0
+  * human register 40002 maps to PDU offset 1
+  * … up to human register 49999 → PDU offset 9998
+
+Throughout this proxy:
+  - Any register numbers or ranges in `register_transformations` or in formulas
+    must be specified in the _human_ 40001-based numbering.
+  - Internally, the proxy subtracts **40001** to convert to the zero-based offset
+    before issuing requests to the backend device.
+  - Formulas reference registers as `$<human_reg>` (e.g. `$40210 * 0.5`).
+
 ## Running the server
 
 First, you will need write a configuration file where you specify for each modbus device you which to control:
@@ -103,7 +119,7 @@ Note that **the reverse also applies**: if you forward unit ID 1 to unit ID 0, *
 
 ### Transforming Register Values
 
-If some holding registers require custom scaling or polarity correction, you can specify value transformations per register using the `register_transformations` key in your device configuration. Each entry maps a register address or a range (`"start-end"`) to a simple formula string (for example, `"* -1"` to invert polarity or `"+ 5"` to add an offset).
+If some holding registers require custom scaling or polarity correction, you can specify value transformations per register using the `register_transformations` key in your device configuration. Each entry maps a human Modbus register number (40001–49999) or a range (`"start-end"`) to a simple formula string. Internally, the proxy subtracts 40001 to convert the human register number into a zero-based PDU offset before applying formulas.
 
 Supported operations:
   * Multiplication (`*`)
@@ -119,8 +135,10 @@ devices:
   listen:
     bind: 0:9000
   register_transformations:
-    "40206-40209": "* -1"   # invert sign for registers 40206 to 40209
-    "40010": "+ 100"       # add 100 to register 40010
+    # invert sign for holding registers 40206 to 40209 (PDU offsets 205–208)
+    "40206-40209": "* -1"
+    # add 100 to holding register 40010 (PDU offset 9)
+    "40010": "+ 100"
 ```
 
 ## Running the examples

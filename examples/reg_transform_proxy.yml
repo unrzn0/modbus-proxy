@@ -3,6 +3,7 @@ devices:
       url: 192.168.178.199:502
     listen:
       bind: 0.0.0.0:1502
+    # register_transformations keys use human Modbus register numbers (40001-based)
     register_transformations:
       "40196-40199": "* 0.1"
       "40200": "int($40196 * 1.72 * 0.1)"

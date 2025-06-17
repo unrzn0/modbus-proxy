@@ -490,9 +490,11 @@ class ModBus(Connection):
                 dest_end = int(dend)
             else:
                 dest_start = dest_end = int(key)
-            if dest_start >= 40000:
+            # convert human-style register numbers (>=40000) to 0-based offsets
+            # convert human-style register numbers (>=40001) to 0-based offsets
+            if dest_start >= 40001:
                 dest_start -= 40001
-            if dest_end >= 40000:
+            if dest_end >= 40001:
                 dest_end -= 40001
             m_un = unary_re.match(formula)
             if m_un:
@@ -586,7 +588,7 @@ class ModBus(Connection):
                         base = 0
                         orig_start, orig_count, exp_start, exp_count = mapping
                 else:
-                    # fallback for non-expanded requests
+                    # fallback for non-expanded requests: normalize human-style to 0-based
                     raw_start = int.from_bytes(request[8:10], 'big')
                     base = 40001 if raw_start >= 40001 else 0
                     orig_start = raw_start - base
@@ -598,7 +600,7 @@ class ModBus(Connection):
                     off = 9 + j * 2
                     raw = int.from_bytes(data[off:off+2], 'big')
                     val = raw - 0x10000 if (raw & 0x8000) else raw
-                    human = exp_start + j + 40001
+                    human = exp_start + j + base
                     ctx[f'r{human}'] = val
                 # apply each transformation function to the expanded block
                 for dest_start, dest_end, fn, deps in self._register_transforms:
@@ -609,7 +611,7 @@ class ModBus(Connection):
                             raw = int.from_bytes(data[off:off+2], 'big')
                             # signed 16-bit value
                             signed = raw - 0x10000 if (raw & 0x8000) else raw
-                            human = reg_addr + 40001
+                            human = reg_addr + base
                             new_val = fn(raw, human, ctx)
                             # log transformation details
                             self.log.debug(
