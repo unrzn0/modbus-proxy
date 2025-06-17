@@ -119,7 +119,7 @@ Note that **the reverse also applies**: if you forward unit ID 1 to unit ID 0, *
 
 ### Transforming Register Values
 
-If some holding registers require custom scaling or polarity correction, you can specify value transformations per register using the `register_transformations` key in your device configuration. Each entry maps a human Modbus register number (40001–49999) or a range (`"start-end"`) to a simple formula string. Internally, the proxy subtracts 40001 to convert the human register number into a zero-based PDU offset before applying formulas.
+If some registers require custom scaling or polarity correction, you can specify value transformations per register using the `register_transformations` key in your device configuration. Each entry maps a human Modbus register number (40001–49999) or a range (`"start-end"`) to a simple formula string. Internally, the proxy subtracts 40001 to convert the human register number into a zero-based PDU offset before applying formulas. Transformations apply to both Read Holding Registers (function code 3) and Read Input Registers (function code 4).
 
 Supported operations:
   * Multiplication (`*`)
@@ -138,8 +138,7 @@ backend to evaluate the formula.  This is done in a fully Modbus/TCP-compliant w
      - any additional offsets extracted from `$<human_reg>` references (
        human_reg - 40001 → PDU offset)
   2. It then groups these offsets into the minimal set of contiguous segments.
-  3. For each segment, it issues a `Read Holding Registers` (function code 3) request with
-     a valid start and count (ensuring `count ≤ 125`).
+  3. For each segment, it issues a `Read Holding Registers` (function code 3) or `Read Input Registers` (function code 4) request matching the original function code, with a valid start and count (ensuring `count ≤ 125`).
   4. It merges the responses into one expanded data block, applies your transformation
      functions over that block, and finally trims the result back to the client’s original range
      (so clients still only see exactly the registers they asked for, now with transforms).
