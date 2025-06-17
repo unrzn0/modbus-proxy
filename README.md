@@ -127,6 +127,27 @@ Supported operations:
   * Addition (`+`)
   * Subtraction (`-`)
 
+#### Cross-Register Formulas and Fetch Expansion
+
+Formulas can reference other holding registers by their human number (e.g. `$40210 * 0.5`).  When such
+dependencies lie outside the client’s original read window, the proxy must fetch extra words from the
+backend to evaluate the formula.  This is done in a fully Modbus/TCP-compliant way:
+
+  1. The proxy computes the set of _normalized_ PDU offsets needed:
+     - the client’s requested range (start..start+count-1)
+     - any additional offsets extracted from `$<human_reg>` references (
+       human_reg - 40001 → PDU offset)
+  2. It then groups these offsets into the minimal set of contiguous segments.
+  3. For each segment, it issues a `Read Holding Registers` (function code 3) request with
+     a valid start and count (ensuring `count ≤ 125`).
+  4. It merges the responses into one expanded data block, applies your transformation
+     functions over that block, and finally trims the result back to the client’s original range
+     (so clients still only see exactly the registers they asked for, now with transforms).
+
+This segmentation approach respects the Modbus protocol limits (max 125 registers per request)
+and never sends illegal PDU addresses.  Internally, the code tracks mapping by transaction ID to
+ensure replies are correctly sliced after transformation.
+
 Example:
 ```yaml
 devices:
